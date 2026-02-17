@@ -875,14 +875,14 @@ function run_diagnosis() {
     if [[ -f "$CONFIG_FILE" ]]; then
         echo -e "  設定檔: ${CYAN}${CONFIG_FILE}${NC}     ${GREEN}✓ 存在${NC}"
     else
-        echo -e "  設定檔: ${CYAN}${CONFIG_FILE}${NC}     ${RED}✗ 不存在${NC}"
+        echo -e "  設定檔: ${CYAN}${CONFIG_FILE}${NC}     ${YELLOW}— 未設定 (${SCRIPT_NAME} config)${NC}"
     fi
 
     # 2. 環境變數檔
     if [[ -f "$PROFILE_FILE" ]]; then
         echo -e "  環境變數檔: ${CYAN}${PROFILE_FILE}${NC}  ${GREEN}✓ 存在${NC}"
     else
-        echo -e "  環境變數檔: ${CYAN}${PROFILE_FILE}${NC}  ${RED}✗ 不存在${NC}"
+        echo -e "  環境變數檔: ${CYAN}${PROFILE_FILE}${NC}  ${YELLOW}— 未啟用 (${SCRIPT_NAME} on 後產生)${NC}"
     fi
 
     # 3. Shell hook
