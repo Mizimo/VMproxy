@@ -154,11 +154,8 @@ function scan_proxy_server() {
             echo "" >&2
             echo -e "  繼續操作即表示${RED}你已獲得該網路的使用授權，後果自負${NC}。" >&2
             echo "" >&2
-            echo "  1) 繼續掃描（僅測試 ARP 已知設備，不掃描全子網）" >&2
-            echo "  2) 停止掃描並手動設定代理位址" >&2
-            echo "" >&2
-            read -rp "  選擇 [1/2]: " choice
-            if [[ "$choice" != "1" ]]; then
+            read -rp "  繼續掃描？（僅測試 ARP 已知設備，不掃描全子網）[y/N]: " choice
+            if [[ "$choice" != [yY] ]]; then
                 echo "" >&2
                 echo -e "  提示: ${CYAN}$SCRIPT_NAME config <IP> <port>${NC}" >&2
                 echo -e "        ${CYAN}$SCRIPT_NAME config auto --range 192.168.1.1-50${NC}" >&2
