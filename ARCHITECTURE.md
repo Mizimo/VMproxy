@@ -147,7 +147,7 @@ load_config
 # >>> vmproxy >>>
 [[ -f ~/.vmproxy_env ]] && source ~/.vmproxy_env
 function vmproxy() {            ← wrapper function
-    command vmproxy "$@"        ← 呼叫真正的腳本（子進程）
+    command /usr/local/bin/vmproxy "$@"  ← 完整路徑，不依賴 PATH
     case "$1" in
         on)  source ~/.vmproxy_env ;;        ← 回到當前 shell，自動生效
         off) unset http_proxy ... ;;         ← 自動清除環境變數
@@ -161,7 +161,11 @@ function vmproxy() {            ← wrapper function
 
 **為什麼需要 wrapper：** 腳本是子進程（fork），無法修改父進程（當前 shell）的環境變數。wrapper function 跑在當前 shell 中，先呼叫腳本做系統代理設定，再在當前 shell 補上 `source` 或 `unset`。`command vmproxy` 中的 `command` 跳過同名函數，避免無限遞迴。
 
+**完整路徑：** `init_shell()` 寫入時透過 `resolve_self_path()` 取得腳本完整路徑，將 `command vmproxy` 替換為 `command "/actual/path/vmproxy"`，確保非互動 SSH 等 PATH 不完整的環境也能正常運作。
+
 **舊版相容：** `init_shell()` 偵測到無 marker 的舊版 hook 時，自動移除後安裝新版。`uninit_shell()` 同時支援 marker 移除和舊版 pattern 移除。`run_diagnosis()` 區分新版（✓）、舊版（⚠ 建議重新 init）、未安裝（✗）。
+
+**安全刪除：** `uninit_shell()` 在執行 sed 範圍刪除前，先驗證開始 marker (`# >>> vmproxy >>>`) 和結束 marker (`# <<< vmproxy <<<`) 都存在。任一缺失則警告用戶手動檢查，避免結束 marker 被意外刪除時 sed 誤刪到 EOF。
 
 ## Doctor 子系統
 
