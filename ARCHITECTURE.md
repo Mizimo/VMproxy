@@ -32,7 +32,16 @@ vmproxy
 │   ├── disable_proxy                 關閉
 │   ├── show_status                   狀態（含連通性檢查）
 │   ├── init_shell / uninit_shell     Shell hook 管理
-└── F. 主入口                          case 分發
+├── F. Doctor — 診斷與維護
+│   ├── resolve_self_path             腳本自身路徑解析
+│   ├── run_diagnosis                 全面診斷（設定檔/hook/連通性/版本）
+│   ├── show_doctor_menu              互動式選單（依診斷結果動態顯示）
+│   ├── do_update                     更新（下載 + 語法檢查 + 備份 + 覆蓋）
+│   ├── do_rollback                   回滾（從 .bak 還原）
+│   ├── do_cleanup                    清理環境（關代理 + 移 hook + 刪設定）
+│   ├── do_fix_hook                   安裝 shell hook（呼叫 init_shell）
+│   └── doctor                        子指令分發
+└── G. 主入口                          case 分發
 ```
 
 ## 端口變數
@@ -65,14 +74,6 @@ MIXED_PORT="7890"
 - `kwriteconfig`：同上
 - `env 檔`：`http_proxy`/`https_proxy` 用 `HTTP_PORT`，`all_proxy` 用 `SOCKS_PORT`
 - `test_host_reachable` / `scan_proxy_server`：用 `MIXED_PORT`（代表主端口）
-
-## 向下相容
-
-`load_config()` 中：
-```bash
-[[ -n "${PROXY_PORT:-}" && -z "${MIXED_PORT:-}" ]] && MIXED_PORT="$PROXY_PORT"
-```
-舊版 config 檔含 `PROXY_PORT` 時自動遷移為 `MIXED_PORT`。下次 `save_config()` 會寫入新格式。
 
 ## LAN 掃描流程
 
@@ -137,6 +138,53 @@ load_config
 | zsh | `.zshrc` | `.zprofile` |
 
 `init_shell()` 同時寫入兩個檔案，`uninit_shell()` 同時清除。
+
+## Doctor 子系統
+
+`vmproxy doctor` 提供一站式維護工具，整合診斷、更新、回滾、清理。
+
+### 設計決策
+
+- `init` 保留頂層：安裝流程常用（install → init → config → on）
+- `uninit` + `uninstall` 合併為 `doctor cleanup`：功能重疊（uninit 是 uninstall 的子集），"cleanup"（清理環境）比 "uninstall"（不會刪除腳本本身）更準確
+- `update` / `rollback` 併入 doctor：版本管理屬於維護範疇
+
+### 互動流程
+
+```
+vmproxy doctor
+  │
+  ├─ 1. 診斷（始終執行）
+  │     ├─ 設定檔 ~/.vmproxy.conf
+  │     ├─ 環境變數檔 ~/.vmproxy_env
+  │     ├─ Shell hook（grep rc 檔）
+  │     ├─ 代理連通性（test_host_reachable）
+  │     ├─ 外網連通性（curl UPDATE_URL）
+  │     └─ 版本比對（外網可達時下載遠端版本）
+  │
+  ├─ 2. 選單（僅在有可操作項時）
+  │     ├─ u) 更新（UPDATE_AVAILABLE）
+  │     ├─ r) 回滾（BAK_EXISTS）
+  │     └─ f) 安裝 hook（HOOK_MISSING）
+  │
+  └─ 3. 執行用戶選擇
+```
+
+### 更新流程 (do_update)
+
+```
+下載到暫存檔 → 取版本號 → 比對 → bash -n 語法檢查 → 備份 .bak → 覆蓋（自動判斷 sudo）
+```
+
+失敗時提示 `vmproxy on` 啟用代理；成功時提示 `vmproxy doctor rollback`。
+
+### 回滾流程 (do_rollback)
+
+`resolve_self_path()` 取得腳本路徑 → 檢查 `.bak` 存在 → 覆蓋回去（自動判斷 sudo）→ 顯示回滾後版本號。
+
+### 路徑解析 (resolve_self_path)
+
+`command -v "$SCRIPT_NAME"` 優先（PATH 中的實際路徑），fallback 到 `$0`。
 
 ## 跨平台差異
 

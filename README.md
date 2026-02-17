@@ -52,6 +52,9 @@ export PATH="$HOME/.local/bin:$PATH"
 ## 用法
 
 ```bash
+# 將自動載入寫入 shell 設定檔（新終端自動生效）
+vmproxy init
+
 # 設定代理位址（預設 192.168.1.1:7890）
 vmproxy config 192.168.1.100 7890
 vmproxy config 192.168.1.100:1080
@@ -69,11 +72,11 @@ vmproxy off
 # 查看狀態（含即時連通性檢查）
 vmproxy status
 
-# 將自動載入寫入 shell 設定檔（新終端自動生效）
-vmproxy init
-
-# 從 shell 設定檔移除
-vmproxy uninit
+# 診斷、更新、維護
+vmproxy doctor                           # 互動式：全面診斷 + 選單
+vmproxy doctor update                    # 更新至最新版本
+vmproxy doctor rollback                  # 回滾至上一版本
+vmproxy doctor cleanup                   # 清理環境（還原網路 + 移除設定）
 ```
 
 執行 `on` 後，需在當前終端手動載入一次：
@@ -122,6 +125,9 @@ rm -f ~/.linuxproxy.conf ~/.linuxproxy_env
 vmproxy config <代理伺服器IP> <port>
 vmproxy init
 vmproxy on
+
+# 如果之後需要完整清理 vmproxy:
+vmproxy doctor cleanup
 ```
 
 ## 注意事項
