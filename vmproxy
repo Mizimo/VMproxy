@@ -143,14 +143,14 @@ function scan_proxy_server() {
     if [[ ${#arp_hosts[@]} -gt 0 ]]; then
         local arp_count=${#arp_hosts[@]}
 
-        if [[ $arp_count -gt 30 ]]; then
+        if [[ $arp_count -gt 10 ]]; then
             echo "" >&2
             echo -e "  ${RED}[警告] ARP 表中有 ${arp_count} 台設備${NC}" >&2
             echo "" >&2
-            echo -e "  ${RED}大量端口掃描在公司或公共網路中可能觸發安全警報，${NC}" >&2
-            echo -e "  ${RED}或被網管視為攻擊行為。建議使用 --range 縮小範圍。${NC}" >&2
+            echo -e "  ${RED}大量端口掃描${NC}在${RED}公司或公共網路${NC}中可能觸發安全警報，" >&2
+            echo -e "  或被網管視為${RED}攻擊行為${NC}。建議使用 --range 縮小範圍。" >&2
             echo "" >&2
-            echo -e "  ${RED}繼續操作即表示你已獲得該網路的使用授權，後果自負。${NC}" >&2
+            echo -e "  繼續操作即表示${RED}你已獲得該網路的使用授權，後果自負${NC}。" >&2
             echo "" >&2
             echo "  1) 繼續掃描（僅測試 ARP 已知設備，不掃描全子網）" >&2
             echo "  2) 停止掃描並手動設定代理位址" >&2
