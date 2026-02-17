@@ -1,0 +1,443 @@
+#!/bin/bash
+# linuxproxy for Linux
+# Version 2026.02
+# 讓 Linux 一鍵切換 HTTP/HTTPS/SOCKS 代理
+# 基於 macproxy 移植
+# Author: 藥アイ & ChatGPT & Claude
+
+CONFIG_FILE="$HOME/.linuxproxy.conf"
+PROFILE_FILE="$HOME/.linuxproxy_env"
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
+
+# --- 載入/初始化設定 ---
+function load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+    fi
+    PROXY_HOST="${PROXY_HOST:-192.168.1.1}"
+    PROXY_PORT="${PROXY_PORT:-7890}"
+    PROXY_URL="http://${PROXY_HOST}:${PROXY_PORT}"
+}
+
+function save_config() {
+    cat > "$CONFIG_FILE" <<EOF
+PROXY_HOST="$PROXY_HOST"
+PROXY_PORT="$PROXY_PORT"
+EOF
+}
+
+# --- 偵測桌面環境 ---
+function detect_de() {
+    if [[ -n "${XDG_CURRENT_DESKTOP:-}" ]]; then
+        case "${XDG_CURRENT_DESKTOP,,}" in
+            *gnome*|*unity*|*budgie*|*cinnamon*|*pantheon*)
+                echo "gnome" ;;
+            *kde*)
+                echo "kde" ;;
+            *)
+                echo "unknown" ;;
+        esac
+    elif [[ -n "${GNOME_DESKTOP_SESSION_ID:-}" ]]; then
+        echo "gnome"
+    elif [[ -n "${KDE_FULL_SESSION:-}" ]]; then
+        echo "kde"
+    else
+        echo "unknown"
+    fi
+}
+
+# --- 偵測活躍網路介面 ---
+function detect_interfaces() {
+    local interfaces=()
+    while IFS= read -r iface; do
+        [[ -z "$iface" ]] && continue
+        [[ "$iface" == "lo" ]] && continue
+        local state
+        state=$(ip link show "$iface" 2>/dev/null | grep -o 'state [A-Z]*' | awk '{print $2}')
+        if [[ "$state" == "UP" ]]; then
+            local ip_addr
+            ip_addr=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[0-9.]+')
+            if [[ -n "$ip_addr" ]]; then
+                interfaces+=("$iface ($ip_addr)")
+            fi
+        fi
+    done < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//')
+
+    if [[ ${#interfaces[@]} -eq 0 ]]; then
+        echo -e "${RED}[錯誤] 未找到活躍的網路介面${NC}" >&2
+        return 1
+    fi
+    printf '%s\n' "${interfaces[@]}"
+}
+
+# --- GNOME 代理設定 ---
+function gnome_proxy_on() {
+    gsettings set org.gnome.system.proxy mode 'manual'
+    gsettings set org.gnome.system.proxy.http host "$PROXY_HOST"
+    gsettings set org.gnome.system.proxy.http port "$PROXY_PORT"
+    gsettings set org.gnome.system.proxy.https host "$PROXY_HOST"
+    gsettings set org.gnome.system.proxy.https port "$PROXY_PORT"
+    gsettings set org.gnome.system.proxy.socks host "$PROXY_HOST"
+    gsettings set org.gnome.system.proxy.socks port "$PROXY_PORT"
+}
+
+function gnome_proxy_off() {
+    gsettings set org.gnome.system.proxy mode 'none'
+}
+
+function gnome_proxy_status() {
+    local mode http_host http_port https_host https_port socks_host socks_port
+    mode=$(gsettings get org.gnome.system.proxy mode 2>/dev/null | tr -d "'")
+    http_host=$(gsettings get org.gnome.system.proxy.http host 2>/dev/null | tr -d "'")
+    http_port=$(gsettings get org.gnome.system.proxy.http port 2>/dev/null)
+    https_host=$(gsettings get org.gnome.system.proxy.https host 2>/dev/null | tr -d "'")
+    https_port=$(gsettings get org.gnome.system.proxy.https port 2>/dev/null)
+    socks_host=$(gsettings get org.gnome.system.proxy.socks host 2>/dev/null | tr -d "'")
+    socks_port=$(gsettings get org.gnome.system.proxy.socks port 2>/dev/null)
+
+    echo -e "  代理模式: ${CYAN}${mode}${NC}"
+    echo "    HTTP:  ${http_host}:${http_port}"
+    echo "    HTTPS: ${https_host}:${https_port}"
+    echo "    SOCKS: ${socks_host}:${socks_port}"
+}
+
+# --- KDE 代理設定 ---
+function kde_find_kwriteconfig() {
+    if command -v kwriteconfig6 &>/dev/null; then
+        echo "kwriteconfig6"
+    elif command -v kwriteconfig5 &>/dev/null; then
+        echo "kwriteconfig5"
+    else
+        echo ""
+    fi
+}
+
+function kde_find_kreadconfig() {
+    if command -v kreadconfig6 &>/dev/null; then
+        echo "kreadconfig6"
+    elif command -v kreadconfig5 &>/dev/null; then
+        echo "kreadconfig5"
+    else
+        echo ""
+    fi
+}
+
+function kde_proxy_on() {
+    local kw
+    kw=$(kde_find_kwriteconfig)
+    if [[ -z "$kw" ]]; then
+        echo -e "${RED}[錯誤] 未找到 kwriteconfig5/6${NC}" >&2
+        return 1
+    fi
+    # KDE ProxyType: 0=直接, 1=手動, 2=PAC, 3=自動偵測, 4=系統
+    "$kw" --file kioslaverc --group "Proxy Settings" --key ProxyType 1
+    "$kw" --file kioslaverc --group "Proxy Settings" --key httpProxy "http://${PROXY_HOST} ${PROXY_PORT}"
+    "$kw" --file kioslaverc --group "Proxy Settings" --key httpsProxy "http://${PROXY_HOST} ${PROXY_PORT}"
+    "$kw" --file kioslaverc --group "Proxy Settings" --key socksProxy "socks://${PROXY_HOST} ${PROXY_PORT}"
+    # 通知 KDE 重新載入設定
+    if command -v dbus-send &>/dev/null; then
+        dbus-send --type=signal /KIO/Scheduler org.kde.KIO.Scheduler.reparseSlaveConfiguration string:""
+    fi
+}
+
+function kde_proxy_off() {
+    local kw
+    kw=$(kde_find_kwriteconfig)
+    if [[ -z "$kw" ]]; then
+        echo -e "${RED}[錯誤] 未找到 kwriteconfig5/6${NC}" >&2
+        return 1
+    fi
+    "$kw" --file kioslaverc --group "Proxy Settings" --key ProxyType 0
+    if command -v dbus-send &>/dev/null; then
+        dbus-send --type=signal /KIO/Scheduler org.kde.KIO.Scheduler.reparseSlaveConfiguration string:""
+    fi
+}
+
+function kde_proxy_status() {
+    local kr
+    kr=$(kde_find_kreadconfig)
+    if [[ -z "$kr" ]]; then
+        echo -e "  ${RED}未找到 kreadconfig5/6${NC}"
+        return
+    fi
+    local proxy_type http_proxy https_proxy socks_proxy
+    proxy_type=$("$kr" --file kioslaverc --group "Proxy Settings" --key ProxyType 2>/dev/null)
+    http_proxy=$("$kr" --file kioslaverc --group "Proxy Settings" --key httpProxy 2>/dev/null)
+    https_proxy=$("$kr" --file kioslaverc --group "Proxy Settings" --key httpsProxy 2>/dev/null)
+    socks_proxy=$("$kr" --file kioslaverc --group "Proxy Settings" --key socksProxy 2>/dev/null)
+
+    local mode_text="直接連線"
+    case "$proxy_type" in
+        1) mode_text="手動" ;;
+        2) mode_text="PAC" ;;
+        3) mode_text="自動偵測" ;;
+        4) mode_text="系統" ;;
+    esac
+    echo -e "  代理模式: ${CYAN}${mode_text}${NC} (type=${proxy_type})"
+    echo "    HTTP:  ${http_proxy:-未設定}"
+    echo "    HTTPS: ${https_proxy:-未設定}"
+    echo "    SOCKS: ${socks_proxy:-未設定}"
+}
+
+# --- 啟用代理 ---
+function enable_proxy() {
+    load_config
+    local de
+    de=$(detect_de)
+
+    echo -e "${GREEN}→ 啟用系統代理: ${PROXY_URL}${NC}"
+
+    # 顯示活躍介面（僅供參考）
+    local interfaces
+    interfaces=$(detect_interfaces 2>/dev/null)
+    if [[ -n "$interfaces" ]]; then
+        echo -e "  活躍介面:"
+        while IFS= read -r iface; do
+            echo -e "    ${CYAN}${iface}${NC}"
+        done <<< "$interfaces"
+    fi
+
+    # 設定桌面環境代理
+    case "$de" in
+        gnome)
+            echo -e "  桌面環境: ${CYAN}GNOME${NC}"
+            gnome_proxy_on
+            ;;
+        kde)
+            echo -e "  桌面環境: ${CYAN}KDE${NC}"
+            kde_proxy_on
+            ;;
+        *)
+            echo -e "  桌面環境: ${YELLOW}未知 (僅設定環境變數)${NC}"
+            ;;
+    esac
+
+    # 寫入環境變數檔（供 shell rc 檔 source）
+    cat > "$PROFILE_FILE" <<EOF
+export http_proxy=$PROXY_URL
+export https_proxy=$PROXY_URL
+export all_proxy=socks5://${PROXY_HOST}:${PROXY_PORT}
+export HTTP_PROXY=$PROXY_URL
+export HTTPS_PROXY=$PROXY_URL
+export ALL_PROXY=socks5://${PROXY_HOST}:${PROXY_PORT}
+EOF
+
+    echo -e "${GREEN}[OK] 系統代理已啟用${NC}"
+    echo -e "  提示: 執行 ${CYAN}source ~/.linuxproxy_env${NC} 使當前終端生效"
+}
+
+# --- 關閉代理 ---
+function disable_proxy() {
+    local de
+    de=$(detect_de)
+
+    echo -e "${YELLOW}→ 關閉系統代理${NC}"
+
+    case "$de" in
+        gnome)
+            echo -e "  桌面環境: ${CYAN}GNOME${NC}"
+            gnome_proxy_off
+            ;;
+        kde)
+            echo -e "  桌面環境: ${CYAN}KDE${NC}"
+            kde_proxy_off
+            ;;
+        *)
+            echo -e "  桌面環境: ${YELLOW}未知 (僅清除環境變數)${NC}"
+            ;;
+    esac
+
+    rm -f "$PROFILE_FILE"
+    echo -e "${YELLOW}[OK] 系統代理已關閉${NC}"
+    echo -e "  提示: 執行 ${CYAN}unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY${NC} 清除當前終端變數"
+}
+
+# --- 查看狀態 ---
+function show_status() {
+    load_config
+    local de
+    de=$(detect_de)
+
+    echo "---- linuxproxy 狀態 ----"
+    echo -e "設定: ${CYAN}${PROXY_HOST}:${PROXY_PORT}${NC}"
+    echo ""
+
+    # 顯示活躍介面
+    local interfaces
+    interfaces=$(detect_interfaces 2>/dev/null)
+    if [[ -n "$interfaces" ]]; then
+        echo "  活躍介面:"
+        while IFS= read -r iface; do
+            echo -e "    ${CYAN}${iface}${NC}"
+        done <<< "$interfaces"
+        echo ""
+    fi
+
+    # 顯示桌面環境代理狀態
+    echo -e "  桌面環境: ${CYAN}${de}${NC}"
+    case "$de" in
+        gnome) gnome_proxy_status ;;
+        kde)   kde_proxy_status ;;
+        *)     echo -e "  ${YELLOW}無法讀取桌面環境代理設定${NC}" ;;
+    esac
+
+    echo ""
+    if [[ -n "${http_proxy:-}" ]]; then
+        echo -e "  [ENV] http_proxy=${http_proxy}"
+        echo -e "  [ENV] https_proxy=${https_proxy:-未設定}"
+        echo -e "  [ENV] all_proxy=${all_proxy:-未設定}"
+    else
+        echo -e "  [ENV] ${RED}環境變數未設定${NC}"
+    fi
+    echo "-------------------------"
+}
+
+# --- 設定代理位址 ---
+function config_proxy() {
+    load_config
+    if [[ -z "$2" ]]; then
+        echo "---- linuxproxy 當前設定 ----"
+        echo -e "  位址: ${CYAN}${PROXY_HOST}${NC}"
+        echo -e "  連接埠: ${CYAN}${PROXY_PORT}${NC}"
+        echo ""
+        echo "用法:"
+        echo "  linuxproxy config <host> [port]    設定代理位址與連接埠"
+        echo "  linuxproxy config <host>:<port>    設定代理位址與連接埠"
+        echo ""
+        echo "範例:"
+        echo "  linuxproxy config 192.168.1.100 7890"
+        echo "  linuxproxy config 192.168.1.100:1080"
+        return
+    fi
+
+    local input="$2"
+    local new_port="${3:-}"
+
+    # 支援 host:port 格式
+    if [[ "$input" == *":"* && -z "$new_port" ]]; then
+        PROXY_HOST="${input%%:*}"
+        PROXY_PORT="${input##*:}"
+    else
+        PROXY_HOST="$input"
+        [[ -n "$new_port" ]] && PROXY_PORT="$new_port"
+    fi
+
+    save_config
+    echo -e "${GREEN}[OK] 設定已儲存${NC}"
+    echo -e "  位址: ${CYAN}${PROXY_HOST}${NC}"
+    echo -e "  連接埠: ${CYAN}${PROXY_PORT}${NC}"
+    echo -e "  提示: 執行 ${CYAN}linuxproxy on${NC} 使新設定生效"
+}
+
+# --- 初始化 shell 自動載入 ---
+SHELL_HOOK='# linuxproxy 環境變數自動載入
+[[ -f ~/.linuxproxy_env ]] && source ~/.linuxproxy_env'
+
+function detect_rc_file() {
+    case "$(basename "$SHELL")" in
+        zsh)  echo "$HOME/.zshrc" ;;
+        bash) echo "$HOME/.bashrc" ;;
+        fish) echo "$HOME/.config/fish/config.fish" ;;
+        *)    echo "$HOME/.profile" ;;
+    esac
+}
+
+# 取得所有需要寫入的設定檔
+# .bashrc 僅供互動式 shell 讀取；非互動 SSH 命令 (ssh host 'cmd')
+# 不會讀 .bashrc，因此需要同時寫入 .profile/.bash_profile
+function get_init_files() {
+    local files=()
+    local rc_file
+    rc_file=$(detect_rc_file)
+    files+=("$rc_file")
+
+    local shell_name
+    shell_name=$(basename "$SHELL")
+
+    if [[ "$shell_name" == "bash" ]]; then
+        # bash 登入 shell 讀取順序: .bash_profile > .bash_login > .profile (只讀第一個存在的)
+        # 非互動 SSH 命令也走登入 shell 路徑
+        if [[ -f "$HOME/.bash_profile" ]]; then
+            files+=("$HOME/.bash_profile")
+        elif [[ -f "$HOME/.bash_login" ]]; then
+            files+=("$HOME/.bash_login")
+        else
+            files+=("$HOME/.profile")
+        fi
+    elif [[ "$shell_name" == "zsh" ]]; then
+        # zsh 登入時讀 .zprofile，互動時讀 .zshrc，兩者都要寫
+        files+=("$HOME/.zprofile")
+    fi
+
+    # 去重
+    printf '%s\n' "${files[@]}" | sort -u
+}
+
+function init_shell() {
+    local files
+    mapfile -t files < <(get_init_files)
+    local wrote=0
+
+    for f in "${files[@]}"; do
+        if grep -qF 'linuxproxy_env' "$f" 2>/dev/null; then
+            echo -e "${YELLOW}[略過] ${f} 中已存在 linuxproxy 設定${NC}"
+            continue
+        fi
+        echo "" >> "$f"
+        echo "$SHELL_HOOK" >> "$f"
+        echo -e "${GREEN}[OK] 已寫入 ${f}${NC}"
+        wrote=1
+    done
+
+    if [[ $wrote -eq 1 ]]; then
+        echo -e "  互動式終端與 SSH 非互動命令都會自動載入代理環境變數"
+    fi
+
+    # 提示 ~/.ssh/environment 方案（需 sshd 設定 PermitUserEnvironment）
+    echo ""
+    echo -e "  ${CYAN}[提示]${NC} 若 SSH 非互動命令仍未生效，可另外設定:"
+    echo -e "    1. 將代理變數寫入 ${CYAN}~/.ssh/environment${NC}"
+    echo -e "    2. 確認 sshd_config 中 ${CYAN}PermitUserEnvironment yes${NC}"
+}
+
+function uninit_shell() {
+    local files
+    mapfile -t files < <(get_init_files)
+
+    for f in "${files[@]}"; do
+        if ! grep -qF 'linuxproxy_env' "$f" 2>/dev/null; then
+            echo -e "${YELLOW}[略過] ${f} 中未找到 linuxproxy 設定${NC}"
+            continue
+        fi
+        # 移除 linuxproxy 相關行（Linux sed -i 不需要空字串參數）
+        sed -i '/# linuxproxy 環境變數自動載入/d;/linuxproxy_env/d' "$f"
+        # 清除可能殘留的末尾空行
+        sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$f"
+        echo -e "${GREEN}[OK] 已從 ${f} 移除 linuxproxy 設定${NC}"
+    done
+}
+
+# --- 主入口 ---
+case "$1" in
+    on)     enable_proxy ;;
+    off)    disable_proxy ;;
+    status) show_status ;;
+    config) config_proxy "$@" ;;
+    init)   init_shell ;;
+    uninit) uninit_shell ;;
+    *)
+        echo "linuxproxy - Linux 代理管理工具 (v2026.02)"
+        echo ""
+        echo "用法: linuxproxy <指令>"
+        echo ""
+        echo "指令:"
+        echo "  on                   啟用系統代理"
+        echo "  off                  關閉系統代理"
+        echo "  status               查看代理狀態"
+        echo "  config [host] [port] 查看/設定代理位址"
+        echo "  init                 將自動載入寫入 shell 設定檔"
+        echo "  uninit               從 shell 設定檔移除自動載入"
+        echo ""
+        echo "支援桌面環境: GNOME, KDE (其他環境僅設定環境變數)"
+        ;;
+esac
