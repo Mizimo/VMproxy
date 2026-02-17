@@ -14,7 +14,7 @@ CONFIG_FILE="$HOME/.vmproxy.conf"
 PROFILE_FILE="$HOME/.vmproxy_env"
 SCRIPT_NAME="vmproxy"
 
-GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[1;31m'; CYAN='\033[0;36m'; NC='\033[0m'
 
 # ========================================
 # B. 共用函數
@@ -25,8 +25,6 @@ function load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         source "$CONFIG_FILE"
     fi
-    # 向下相容：舊版 config 使用 PROXY_PORT
-    [[ -n "${PROXY_PORT:-}" && -z "${MIXED_PORT:-}" ]] && MIXED_PORT="$PROXY_PORT"
     PROXY_HOST="${PROXY_HOST:-192.168.1.1}"
     MIXED_PORT="${MIXED_PORT:-7890}"
     HTTP_PORT="${HTTP_PORT:-$MIXED_PORT}"
@@ -146,17 +144,23 @@ function scan_proxy_server() {
         local arp_count=${#arp_hosts[@]}
 
         if [[ $arp_count -gt 30 ]]; then
-            echo -e "${YELLOW}[注意] ARP 表中有 ${arp_count} 台設備${NC}" >&2
             echo "" >&2
-            echo "  1) 繼續掃描 ARP 列表中的所有設備" >&2
-            echo "  2) 手動設定代理位址" >&2
+            echo -e "  ${RED}[警告] ARP 表中有 ${arp_count} 台設備${NC}" >&2
+            echo "" >&2
+            echo -e "  ${RED}大量端口掃描在公司或公共網路中可能觸發安全警報，${NC}" >&2
+            echo -e "  ${RED}或被網管視為攻擊行為。建議使用 --range 縮小範圍。${NC}" >&2
+            echo "" >&2
+            echo -e "  ${RED}繼續操作即表示你已獲得該網路的使用授權，後果自負。${NC}" >&2
+            echo "" >&2
+            echo "  1) 繼續掃描（僅測試 ARP 已知設備，不掃描全子網）" >&2
+            echo "  2) 停止掃描並手動設定代理位址" >&2
             echo "" >&2
             read -rp "  選擇 [1/2]: " choice
             if [[ "$choice" != "1" ]]; then
                 echo "" >&2
                 echo -e "  提示: ${CYAN}$SCRIPT_NAME config <IP> <port>${NC}" >&2
                 echo -e "        ${CYAN}$SCRIPT_NAME config auto --range 192.168.1.1-50${NC}" >&2
-                return 1
+                return 2  # 用戶取消，區別於 1（未找到）
             fi
         fi
 
@@ -283,7 +287,8 @@ function config_proxy() {
 
         local found_ip
         found_ip=$(scan_proxy_server "$scan_port" "$range")
-        if [[ -n "$found_ip" ]]; then
+        local scan_ret=$?
+        if [[ $scan_ret -eq 0 && -n "$found_ip" ]]; then
             PROXY_HOST="$found_ip"
             MIXED_PORT="$scan_port"
             HTTP_PORT="$scan_port"
@@ -293,6 +298,9 @@ function config_proxy() {
             echo -e "  位址: ${CYAN}${PROXY_HOST}${NC}"
             echo -e "  端口: ${CYAN}${MIXED_PORT}${NC}"
             echo -e "  提示: 執行 ${CYAN}$SCRIPT_NAME on${NC} 使新設定生效"
+        elif [[ $scan_ret -eq 2 ]]; then
+            # 用戶取消，scan 已印提示，不重複輸出
+            :
         else
             echo -e "${RED}[錯誤] 未找到可用的代理伺服器${NC}"
             echo -e "  提示: 確認代理軟體是否啟動並開啟區域網路連線"
@@ -693,13 +701,16 @@ function enable_proxy() {
         echo -e "${YELLOW}[警告] ${PROXY_HOST}:${MIXED_PORT} 無法連線，掃描區域網路...${NC}"
         local found_ip
         found_ip=$(scan_proxy_server "$MIXED_PORT")
-        if [[ -n "$found_ip" ]]; then
+        local scan_ret=$?
+        if [[ $scan_ret -eq 0 && -n "$found_ip" ]]; then
             PROXY_HOST="$found_ip"
             echo -e "  提示: 執行 ${CYAN}$SCRIPT_NAME config ${found_ip}${NC} 儲存設定"
-        else
+        elif [[ $scan_ret -ne 2 ]]; then
             echo -e "${RED}[錯誤] 找不到可用的代理伺服器${NC}"
             echo -e "  提示: 確認代理軟體是否啟動並開啟區域網路連線"
             echo -e "        ${CYAN}$SCRIPT_NAME config <IP> <port>${NC} 手動設定"
+            return 1
+        else
             return 1
         fi
     fi
