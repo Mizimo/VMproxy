@@ -1,17 +1,19 @@
 # VMproxy
 
-讓虛擬機透過宿主機的代理上網 — 一鍵設定，無需手動修改環境變數。
+讓虛擬機透過區域網路中的代理伺服器上網 — 一鍵設定，支援自動偵測。
 
 ## 使用情境
 
 ```
 ┌──────────────┐         ┌──────────────┐
-│   虛擬機 VM   │ ──────▶ │  宿主機 Host  │ ──────▶ Internet
-│  (Guest OS)  │  proxy  │ (代理服務端)   │
+│   虛擬機 VM   │ ──────▶ │  代理伺服器    │ ──────▶ Internet
+│  (Guest OS)  │  proxy  │ (Host 或 LAN) │
 └──────────────┘         └──────────────┘
 ```
 
-在 UTM 等虛擬化環境下，Guest OS 需要透過 Host 上運行的代理（如 Clash、V2Ray 等）來存取外部網路。`vmproxy` 可以快速設定 Guest 的系統代理與 shell 環境變數，指向 Host 的代理端口。
+在 UTM 等虛擬化環境下，Guest OS 需要透過區域網路中的代理（如 Clash、V2Ray 等）來存取外部網路。`vmproxy` 可以快速設定 Guest 的系統代理與 shell 環境變數，指向代理伺服器的端口。
+
+當網路環境變動（例如從朋友家到自己家），可透過 `vmproxy config auto` 重新掃描 LAN 找到代理伺服器。
 
 ## 支援平台
 
@@ -53,12 +55,18 @@ export PATH="$HOME/.local/bin:$PATH"
 # 設定代理位址（預設 192.168.1.1:7890）
 vmproxy config 192.168.1.100 7890
 vmproxy config 192.168.1.100:1080
+vmproxy config 7890                    # 只改端口
+
+# 自動偵測區域網路中的代理伺服器
+vmproxy config auto                    # 掃描整個 LAN
+vmproxy config auto 7891               # 用指定端口掃描
+vmproxy config auto --range 192.168.1.1-50  # 限定掃描範圍
 
 # 啟用 / 關閉代理
 vmproxy on
 vmproxy off
 
-# 查看狀態
+# 查看狀態（含即時連通性檢查）
 vmproxy status
 
 # 將自動載入寫入 shell 設定檔（新終端自動生效）
@@ -75,6 +83,21 @@ source ~/.vmproxy_env
 ```
 
 或執行 `init` 後開新終端，即可自動載入。
+
+## 自動偵測
+
+`vmproxy on` 啟用時會先測試已設定的代理伺服器是否可達。若連線失敗，自動掃描區域網路：
+
+1. **ARP 快掃** — 從 ARP 表取得已知設備，並行測試代理端口
+2. **子網全掃** — ARP 未命中時，掃描整個 /24 子網（並行 `nc -z`，約 2 秒完成）
+
+若 ARP 表中設備超過 30 台（例如公司網路），會提示選擇繼續掃描或手動設定。
+
+也可以手動觸發掃描：
+
+```bash
+vmproxy config auto
+```
 
 ## 設定檔
 
@@ -96,7 +119,7 @@ rm -f ~/.macproxy.conf ~/.macproxy_env
 rm -f ~/.linuxproxy.conf ~/.linuxproxy_env
 
 # 3. 安裝 vmproxy 後重新設定
-vmproxy config <你的宿主機IP> <port>
+vmproxy config <代理伺服器IP> <port>
 vmproxy init
 vmproxy on
 ```
@@ -104,8 +127,8 @@ vmproxy on
 ## 注意事項
 
 - `vmproxy init` 會同時寫入多個 shell 設定檔（`.bashrc` + `.bash_profile`，或 `.zshrc` + `.zprofile`），確保 SSH 非互動命令也能載入代理變數。
-- 代理位址應填寫宿主機在虛擬機網段中的 IP（例如 UTM 預設的 `192.168.64.1` 或自訂的橋接 IP）。
-- 宿主機的代理軟體需開啟「允許區域網路連線」。
+- 代理伺服器需開啟「允許區域網路連線」。
+- VM 需使用橋接網路（與代理伺服器在同一個 LAN）才能使用自動偵測功能。
 
 ## Author
 

@@ -25,15 +25,23 @@ function load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         source "$CONFIG_FILE"
     fi
+    # 向下相容：舊版 config 使用 PROXY_PORT
+    [[ -n "${PROXY_PORT:-}" && -z "${MIXED_PORT:-}" ]] && MIXED_PORT="$PROXY_PORT"
     PROXY_HOST="${PROXY_HOST:-192.168.1.1}"
-    PROXY_PORT="${PROXY_PORT:-7890}"
-    PROXY_URL="http://${PROXY_HOST}:${PROXY_PORT}"
+    MIXED_PORT="${MIXED_PORT:-7890}"
+    HTTP_PORT="${HTTP_PORT:-$MIXED_PORT}"
+    SOCKS_PORT="${SOCKS_PORT:-$MIXED_PORT}"
 }
 
 function save_config() {
     cat > "$CONFIG_FILE" <<EOF
+# vmproxy config — 由 vmproxy 自動產生，可安全刪除
 PROXY_HOST="$PROXY_HOST"
-PROXY_PORT="$PROXY_PORT"
+MIXED_PORT="$MIXED_PORT"
+
+# 若 HTTP 與 SOCKS 需要不同端口，取消註解並修改：
+# HTTP_PORT="$MIXED_PORT"
+# SOCKS_PORT="$MIXED_PORT"
 EOF
 }
 
@@ -46,40 +54,289 @@ function sed_i() {
     fi
 }
 
+# --- 網路工具 ---
+
+# TCP 端口連通性測試
+# macOS nc: -G = 連線超時（-w 只是閒置超時，不限制 SYN）
+# Linux nc: -w = 連線超時
+function test_host_reachable() {
+    local host="$1" port="$2"
+    if command -v nc &>/dev/null; then
+        if [[ "$OS" == "Darwin" ]]; then
+            nc -z -G 1 "$host" "$port" 2>/dev/null
+        else
+            nc -z -w 1 "$host" "$port" 2>/dev/null
+        fi
+    elif command -v ncat &>/dev/null; then
+        ncat -z -w 1 "$host" "$port" 2>/dev/null
+    else
+        (echo >/dev/tcp/"$host"/"$port") 2>/dev/null
+    fi
+}
+
+# 取得本機 IP
+function get_local_ip() {
+    case "$OS" in
+        Darwin)
+            local iface
+            iface=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+            [[ -n "$iface" ]] && ipconfig getifaddr "$iface" 2>/dev/null
+            ;;
+        Linux)
+            ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}'
+            ;;
+    esac
+}
+
+# 掃描結果選擇（1 台直接回傳，多台讓用戶選）
+# 用法: select_and_return port ip1 ip2 ...
+function select_and_return() {
+    local port="$1"
+    shift
+    local ips=("$@")
+
+    if [[ ${#ips[@]} -eq 1 ]]; then
+        echo -e "  ${GREEN}[找到] ${ips[0]}:${port}${NC}" >&2
+        echo "${ips[0]}"
+        return 0
+    fi
+
+    echo -e "  ${GREEN}[找到 ${#ips[@]} 台代理伺服器]${NC}" >&2
+    local i=1
+    for ip in "${ips[@]}"; do
+        echo "  ${i}) ${ip}:${port}" >&2
+        ((i++))
+    done
+    echo "" >&2
+    read -rp "  選擇 [1-${#ips[@]}]: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ips[@]} )); then
+        echo -e "  ${GREEN}[選擇] ${ips[$((choice-1))]}${NC}" >&2
+        echo "${ips[$((choice-1))]}"
+        return 0
+    else
+        echo -e "  ${RED}[錯誤] 無效的選擇${NC}" >&2
+        return 1
+    fi
+}
+
+# 掃描區域網路尋找代理伺服器
+# 用法: scan_proxy_server [port] [range]
+# 成功時輸出找到的 IP (stdout)，狀態訊息輸出到 stderr
+function scan_proxy_server() {
+    local port="${1:-$MIXED_PORT}"
+    local range="${2:-}"
+
+    echo -e "${CYAN}→ 掃描區域網路中的代理伺服器 (port ${port})...${NC}" >&2
+
+    local my_ip
+    my_ip=$(get_local_ip)
+
+    local tmpdir
+    tmpdir=$(mktemp -d) || return 1
+    trap "rm -rf '$tmpdir'" RETURN
+
+    # ---- Phase 1: ARP 快掃 ----
+    local arp_hosts=()
+    while IFS= read -r ip; do
+        [[ -z "$ip" || "$ip" == "$my_ip" ]] && continue
+        arp_hosts+=("$ip")
+    done < <(arp -a 2>/dev/null | grep -oE '\([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\)' | tr -d '()')
+
+    if [[ ${#arp_hosts[@]} -gt 0 ]]; then
+        local arp_count=${#arp_hosts[@]}
+
+        if [[ $arp_count -gt 30 ]]; then
+            echo -e "${YELLOW}[注意] ARP 表中有 ${arp_count} 台設備${NC}" >&2
+            echo "" >&2
+            echo "  1) 繼續掃描 ARP 列表中的所有設備" >&2
+            echo "  2) 手動設定代理位址" >&2
+            echo "" >&2
+            read -rp "  選擇 [1/2]: " choice
+            if [[ "$choice" != "1" ]]; then
+                echo "" >&2
+                echo -e "  提示: ${CYAN}$SCRIPT_NAME config <IP> <port>${NC}" >&2
+                echo -e "        ${CYAN}$SCRIPT_NAME config auto --range 192.168.1.1-50${NC}" >&2
+                return 1
+            fi
+        fi
+
+        echo -e "  ARP 快掃 (${arp_count} 台)..." >&2
+        local idx=0
+        for h in "${arp_hosts[@]}"; do
+            (test_host_reachable "$h" "$port" && echo "$h" > "$tmpdir/arp_$idx") &
+            ((idx++))
+        done
+        wait
+
+        local found_ips=()
+        for ((i=0; i<idx; i++)); do
+            if [[ -f "$tmpdir/arp_$i" ]]; then
+                found_ips+=("$(cat "$tmpdir/arp_$i")")
+            fi
+        done
+
+        if [[ ${#found_ips[@]} -gt 0 ]]; then
+            select_and_return "$port" "${found_ips[@]}"
+            return $?
+        fi
+    fi
+
+    # ---- Phase 2: 子網全掃 ----
+    if [[ -z "$my_ip" ]]; then
+        echo -e "${RED}[錯誤] 無法取得本機 IP${NC}" >&2
+        return 1
+    fi
+
+    local prefix="${my_ip%.*}"
+    local start_octet=1
+    local end_octet=254
+
+    if [[ -n "$range" ]]; then
+        # 支援 "192.168.1.1-50" 或 "1-50" 格式
+        if [[ "$range" == *"."* ]]; then
+            prefix="${range%.*}"
+            local last_part="${range##*.}"
+            start_octet="${last_part%%-*}"
+            end_octet="${last_part##*-}"
+        else
+            start_octet="${range%%-*}"
+            end_octet="${range##*-}"
+        fi
+    fi
+
+    local total=$((end_octet - start_octet + 1))
+    echo -e "  子網掃描 ${prefix}.${start_octet}-${end_octet} (${total} 台)..." >&2
+
+    for i in $(seq "$start_octet" "$end_octet"); do
+        local target="${prefix}.${i}"
+        [[ "$target" == "$my_ip" ]] && continue
+        (test_host_reachable "$target" "$port" && echo "$target" > "$tmpdir/sub_${i}") &
+    done
+    wait
+
+    local found_ips=()
+    for i in $(seq "$start_octet" "$end_octet"); do
+        if [[ -f "$tmpdir/sub_${i}" ]]; then
+            found_ips+=("$(cat "$tmpdir/sub_${i}")")
+        fi
+    done
+
+    if [[ ${#found_ips[@]} -gt 0 ]]; then
+        select_and_return found_ips "$port"
+        return $?
+    fi
+
+    echo -e "  ${RED}未找到開放 port ${port} 的設備${NC}" >&2
+    return 1
+}
+
 # --- 設定代理位址 ---
 function config_proxy() {
     load_config
-    if [[ -z "$2" ]]; then
+    if [[ -z "${2:-}" ]]; then
         echo "---- $SCRIPT_NAME 當前設定 ----"
         echo -e "  位址: ${CYAN}${PROXY_HOST}${NC}"
-        echo -e "  連接埠: ${CYAN}${PROXY_PORT}${NC}"
+        echo -e "  端口: ${CYAN}${MIXED_PORT}${NC}"
+        if [[ "$HTTP_PORT" != "$MIXED_PORT" ]]; then
+            echo -e "  HTTP 端口: ${CYAN}${HTTP_PORT}${NC}"
+        fi
+        if [[ "$SOCKS_PORT" != "$MIXED_PORT" ]]; then
+            echo -e "  SOCKS 端口: ${CYAN}${SOCKS_PORT}${NC}"
+        fi
         echo ""
         echo "用法:"
-        echo "  $SCRIPT_NAME config <host> [port]    設定代理位址與連接埠"
-        echo "  $SCRIPT_NAME config <host>:<port>    設定代理位址與連接埠"
+        echo "  $SCRIPT_NAME config <host> [port]        設定代理位址與連接埠"
+        echo "  $SCRIPT_NAME config <host>:<port>        設定代理位址與連接埠"
+        echo "  $SCRIPT_NAME config <port>               只設定端口"
+        echo "  $SCRIPT_NAME config auto [port]          自動掃描區域網偵測代理伺服器"
+        echo "  $SCRIPT_NAME config auto --range <range> 限定掃描範圍"
         echo ""
         echo "範例:"
         echo "  $SCRIPT_NAME config 192.168.1.100 7890"
         echo "  $SCRIPT_NAME config 192.168.1.100:1080"
+        echo "  $SCRIPT_NAME config 7890"
+        echo "  $SCRIPT_NAME config auto"
+        echo "  $SCRIPT_NAME config auto 7891"
+        echo "  $SCRIPT_NAME config auto --range 192.168.1.1-50"
         return
     fi
 
     local input="$2"
+
+    # ---- auto 模式：掃描 LAN ----
+    if [[ "$input" == "auto" ]]; then
+        local scan_port="$MIXED_PORT"
+        local range=""
+        shift 2
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --range)
+                    range="${2:-}"
+                    shift 2
+                    ;;
+                *)
+                    scan_port="$1"
+                    shift
+                    ;;
+            esac
+        done
+
+        local found_ip
+        found_ip=$(scan_proxy_server "$scan_port" "$range")
+        if [[ -n "$found_ip" ]]; then
+            PROXY_HOST="$found_ip"
+            MIXED_PORT="$scan_port"
+            HTTP_PORT="$scan_port"
+            SOCKS_PORT="$scan_port"
+            save_config
+            echo -e "${GREEN}[OK] 設定已儲存${NC}"
+            echo -e "  位址: ${CYAN}${PROXY_HOST}${NC}"
+            echo -e "  端口: ${CYAN}${MIXED_PORT}${NC}"
+            echo -e "  提示: 執行 ${CYAN}$SCRIPT_NAME on${NC} 使新設定生效"
+        else
+            echo -e "${RED}[錯誤] 未找到可用的代理伺服器${NC}"
+            echo -e "  提示: 確認代理軟體是否啟動並開啟區域網路連線"
+            echo -e "        ${CYAN}$SCRIPT_NAME config <IP> <port>${NC} 手動設定"
+        fi
+        return
+    fi
+
+    # ---- 一般模式 ----
     local new_port="${3:-}"
 
-    # 支援 host:port 格式
-    if [[ "$input" == *":"* && -z "$new_port" ]]; then
+    if [[ "$input" =~ ^[0-9]+$ ]]; then
+        # 純數字 → 只改端口
+        MIXED_PORT="$input"
+        HTTP_PORT="$input"
+        SOCKS_PORT="$input"
+    elif [[ "$input" == *":"* && -z "$new_port" ]]; then
+        # host:port 格式
         PROXY_HOST="${input%%:*}"
-        PROXY_PORT="${input##*:}"
-    else
+        MIXED_PORT="${input##*:}"
+        HTTP_PORT="$MIXED_PORT"
+        SOCKS_PORT="$MIXED_PORT"
+    elif [[ "$input" == *"."* ]]; then
+        # 含 . → IP 位址（可選端口）
         PROXY_HOST="$input"
-        [[ -n "$new_port" ]] && PROXY_PORT="$new_port"
+        if [[ -n "$new_port" ]]; then
+            MIXED_PORT="$new_port"
+            HTTP_PORT="$new_port"
+            SOCKS_PORT="$new_port"
+        fi
+    else
+        # 其他 → 當作 host
+        PROXY_HOST="$input"
+        if [[ -n "$new_port" ]]; then
+            MIXED_PORT="$new_port"
+            HTTP_PORT="$new_port"
+            SOCKS_PORT="$new_port"
+        fi
     fi
 
     save_config
     echo -e "${GREEN}[OK] 設定已儲存${NC}"
     echo -e "  位址: ${CYAN}${PROXY_HOST}${NC}"
-    echo -e "  連接埠: ${CYAN}${PROXY_PORT}${NC}"
+    echo -e "  端口: ${CYAN}${MIXED_PORT}${NC}"
     echo -e "  提示: 執行 ${CYAN}$SCRIPT_NAME on${NC} 使新設定生效"
 }
 
@@ -157,9 +414,9 @@ function mac_enable_proxy() {
 
     while IFS= read -r svc; do
         echo -e "  ${CYAN}[$svc]${NC}"
-        networksetup -setwebproxy "$svc" "$PROXY_HOST" "$PROXY_PORT"
-        networksetup -setsecurewebproxy "$svc" "$PROXY_HOST" "$PROXY_PORT"
-        networksetup -setsocksfirewallproxy "$svc" "$PROXY_HOST" "$PROXY_PORT"
+        networksetup -setwebproxy "$svc" "$PROXY_HOST" "$HTTP_PORT"
+        networksetup -setsecurewebproxy "$svc" "$PROXY_HOST" "$HTTP_PORT"
+        networksetup -setsocksfirewallproxy "$svc" "$PROXY_HOST" "$SOCKS_PORT"
         networksetup -setwebproxystate "$svc" on
         networksetup -setsecurewebproxystate "$svc" on
         networksetup -setsocksfirewallproxystate "$svc" on
@@ -199,7 +456,9 @@ function mac_show_status() {
 # --- 偵測桌面環境 ---
 function detect_de() {
     if [[ -n "${XDG_CURRENT_DESKTOP:-}" ]]; then
-        case "${XDG_CURRENT_DESKTOP,,}" in
+        local xdg_lower
+        xdg_lower=$(printf '%s' "$XDG_CURRENT_DESKTOP" | tr '[:upper:]' '[:lower:]')
+        case "$xdg_lower" in
             *gnome*|*unity*|*budgie*|*cinnamon*|*pantheon*)
                 echo "gnome" ;;
             *kde*)
@@ -226,7 +485,7 @@ function detect_interfaces() {
         state=$(ip link show "$iface" 2>/dev/null | grep -o 'state [A-Z]*' | awk '{print $2}')
         if [[ "$state" == "UP" ]]; then
             local ip_addr
-            ip_addr=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[0-9.]+')
+            ip_addr=$(ip -4 addr show "$iface" 2>/dev/null | grep -oE 'inet [0-9.]+' | awk '{print $2}')
             if [[ -n "$ip_addr" ]]; then
                 interfaces+=("$iface ($ip_addr)")
             fi
@@ -244,11 +503,11 @@ function detect_interfaces() {
 function gnome_proxy_on() {
     gsettings set org.gnome.system.proxy mode 'manual'
     gsettings set org.gnome.system.proxy.http host "$PROXY_HOST"
-    gsettings set org.gnome.system.proxy.http port "$PROXY_PORT"
+    gsettings set org.gnome.system.proxy.http port "$HTTP_PORT"
     gsettings set org.gnome.system.proxy.https host "$PROXY_HOST"
-    gsettings set org.gnome.system.proxy.https port "$PROXY_PORT"
+    gsettings set org.gnome.system.proxy.https port "$HTTP_PORT"
     gsettings set org.gnome.system.proxy.socks host "$PROXY_HOST"
-    gsettings set org.gnome.system.proxy.socks port "$PROXY_PORT"
+    gsettings set org.gnome.system.proxy.socks port "$SOCKS_PORT"
 }
 
 function gnome_proxy_off() {
@@ -301,9 +560,9 @@ function kde_proxy_on() {
     fi
     # KDE ProxyType: 0=直接, 1=手動, 2=PAC, 3=自動偵測, 4=系統
     "$kw" --file kioslaverc --group "Proxy Settings" --key ProxyType 1
-    "$kw" --file kioslaverc --group "Proxy Settings" --key httpProxy "http://${PROXY_HOST} ${PROXY_PORT}"
-    "$kw" --file kioslaverc --group "Proxy Settings" --key httpsProxy "http://${PROXY_HOST} ${PROXY_PORT}"
-    "$kw" --file kioslaverc --group "Proxy Settings" --key socksProxy "socks://${PROXY_HOST} ${PROXY_PORT}"
+    "$kw" --file kioslaverc --group "Proxy Settings" --key httpProxy "http://${PROXY_HOST} ${HTTP_PORT}"
+    "$kw" --file kioslaverc --group "Proxy Settings" --key httpsProxy "http://${PROXY_HOST} ${HTTP_PORT}"
+    "$kw" --file kioslaverc --group "Proxy Settings" --key socksProxy "socks://${PROXY_HOST} ${SOCKS_PORT}"
     # 通知 KDE 重新載入設定
     if command -v dbus-send &>/dev/null; then
         dbus-send --type=signal /KIO/Scheduler org.kde.KIO.Scheduler.reparseSlaveConfiguration string:""
@@ -428,7 +687,24 @@ function linux_show_status() {
 
 function enable_proxy() {
     load_config
-    echo -e "${GREEN}→ 啟用系統代理: ${PROXY_URL}${NC}"
+
+    # 測試已設定的代理伺服器連通性
+    if ! test_host_reachable "$PROXY_HOST" "$MIXED_PORT"; then
+        echo -e "${YELLOW}[警告] ${PROXY_HOST}:${MIXED_PORT} 無法連線，掃描區域網路...${NC}"
+        local found_ip
+        found_ip=$(scan_proxy_server "$MIXED_PORT")
+        if [[ -n "$found_ip" ]]; then
+            PROXY_HOST="$found_ip"
+            echo -e "  提示: 執行 ${CYAN}$SCRIPT_NAME config ${found_ip}${NC} 儲存設定"
+        else
+            echo -e "${RED}[錯誤] 找不到可用的代理伺服器${NC}"
+            echo -e "  提示: 確認代理軟體是否啟動並開啟區域網路連線"
+            echo -e "        ${CYAN}$SCRIPT_NAME config <IP> <port>${NC} 手動設定"
+            return 1
+        fi
+    fi
+
+    echo -e "${GREEN}→ 啟用系統代理: http://${PROXY_HOST}:${HTTP_PORT}${NC}"
 
     case "$OS" in
         Darwin) mac_enable_proxy ;;
@@ -438,12 +714,13 @@ function enable_proxy() {
 
     # 寫入環境變數檔（大小寫都寫，相容所有工具）
     cat > "$PROFILE_FILE" <<EOF
-export http_proxy=$PROXY_URL
-export https_proxy=$PROXY_URL
-export all_proxy=socks5://${PROXY_HOST}:${PROXY_PORT}
-export HTTP_PROXY=$PROXY_URL
-export HTTPS_PROXY=$PROXY_URL
-export ALL_PROXY=socks5://${PROXY_HOST}:${PROXY_PORT}
+# vmproxy env — 由 vmproxy on 產生，vmproxy off 時刪除，可安全刪除
+export http_proxy=http://${PROXY_HOST}:${HTTP_PORT}
+export https_proxy=http://${PROXY_HOST}:${HTTP_PORT}
+export all_proxy=socks5://${PROXY_HOST}:${SOCKS_PORT}
+export HTTP_PROXY=http://${PROXY_HOST}:${HTTP_PORT}
+export HTTPS_PROXY=http://${PROXY_HOST}:${HTTP_PORT}
+export ALL_PROXY=socks5://${PROXY_HOST}:${SOCKS_PORT}
 EOF
 
     echo -e "${GREEN}[OK] 系統代理已啟用${NC}"
@@ -467,8 +744,15 @@ function disable_proxy() {
 function show_status() {
     load_config
     echo "---- $SCRIPT_NAME 狀態 ----"
-    echo -e "設定: ${CYAN}${PROXY_HOST}:${PROXY_PORT}${NC}"
+    echo -e "設定: ${CYAN}${PROXY_HOST}:${MIXED_PORT}${NC}"
     echo -e "系統: ${CYAN}${OS}${NC}"
+
+    # 即時連通性檢查
+    if test_host_reachable "$PROXY_HOST" "$MIXED_PORT"; then
+        echo -e "連線: ${GREEN}✓ 可達${NC}"
+    else
+        echo -e "連線: ${RED}✗ 不可達${NC} (${CYAN}$SCRIPT_NAME config auto${NC} 重新偵測)"
+    fi
     echo ""
 
     case "$OS" in
@@ -490,7 +774,8 @@ function show_status() {
 
 function init_shell() {
     local files
-    mapfile -t files < <(get_init_files)
+    local files=()
+    while IFS= read -r f; do files+=("$f"); done < <(get_init_files)
     local wrote=0
 
     for f in "${files[@]}"; do
@@ -517,14 +802,15 @@ function init_shell() {
 
 function uninit_shell() {
     local files
-    mapfile -t files < <(get_init_files)
+    local files=()
+    while IFS= read -r f; do files+=("$f"); done < <(get_init_files)
 
     for f in "${files[@]}"; do
         if ! grep -qF 'vmproxy_env' "$f" 2>/dev/null; then
             echo -e "${YELLOW}[略過] ${f} 中未找到 $SCRIPT_NAME 設定${NC}"
             continue
         fi
-        sed_i '/# vmproxy 環境變數自動載入/d;/vmproxy_env/d' "$f"
+        sed_i '/# vmproxy.*載入/d;/vmproxy_env/d' "$f"
         sed_i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$f"
         echo -e "${GREEN}[OK] 已從 ${f} 移除 $SCRIPT_NAME 設定${NC}"
     done
@@ -534,25 +820,49 @@ function uninit_shell() {
 # F. 主入口
 # ========================================
 
+function uninstall() {
+    echo -e "${YELLOW}→ 解除安裝 $SCRIPT_NAME${NC}"
+
+    # 1. 關閉系統代理
+    disable_proxy
+
+    # 2. 移除 shell hook
+    uninit_shell
+
+    # 3. 刪除設定檔
+    rm -f "$CONFIG_FILE"
+    echo -e "${GREEN}[OK] 已刪除 ${CONFIG_FILE}${NC}"
+    rm -f "$PROFILE_FILE"
+    echo -e "${GREEN}[OK] 已刪除 ${PROFILE_FILE}${NC}"
+
+    echo ""
+    echo -e "${GREEN}[OK] 清理完成${NC}"
+    echo -e "  腳本本身請手動刪除: ${CYAN}rm $(command -v $SCRIPT_NAME 2>/dev/null || echo /usr/local/bin/$SCRIPT_NAME)${NC}"
+}
+
 case "$1" in
-    on)     enable_proxy ;;
-    off)    disable_proxy ;;
-    status) show_status ;;
-    config) config_proxy "$@" ;;
-    init)   init_shell ;;
-    uninit) uninit_shell ;;
+    on)        enable_proxy ;;
+    off)       disable_proxy ;;
+    status)    show_status ;;
+    config)    config_proxy "$@" ;;
+    init)      init_shell ;;
+    uninit)    uninit_shell ;;
+    uninstall) uninstall ;;
     *)
         echo "$SCRIPT_NAME - VM 代理管理工具 (v2026.02)"
         echo ""
         echo "用法: $SCRIPT_NAME <指令>"
         echo ""
         echo "指令:"
-        echo "  on                   啟用系統代理"
-        echo "  off                  關閉系統代理"
-        echo "  status               查看代理狀態"
-        echo "  config [host] [port] 查看/設定代理位址"
-        echo "  init                 將自動載入寫入 shell 設定檔"
-        echo "  uninit               從 shell 設定檔移除自動載入"
+        echo "  on                         啟用系統代理"
+        echo "  off                        關閉系統代理"
+        echo "  status                     查看代理狀態"
+        echo "  config [host] [port]       查看/設定代理位址"
+        echo "  config auto [port]         自動掃描區域網偵測代理伺服器"
+        echo "  config <port>              只設定端口"
+        echo "  init                       將自動載入寫入 shell 設定檔"
+        echo "  uninit                     從 shell 設定檔移除自動載入"
+        echo "  uninstall                  完整解除安裝（還原網路 + 清理設定檔）"
         echo ""
         echo "支援: macOS (networksetup), Linux (GNOME/KDE/CLI)"
         ;;
