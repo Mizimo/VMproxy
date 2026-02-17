@@ -170,6 +170,21 @@ vmproxy doctor
   └─ 3. 執行用戶選擇
 ```
 
+### 診斷 (run_diagnosis)
+
+依序檢查六項，每項輸出 ✓/✗ 狀態，同時設定 flag 供選單判斷：
+
+| 檢查項 | 方法 | Flag |
+|---|---|---|
+| 設定檔 | `[[ -f ~/.vmproxy.conf ]]` | — |
+| 環境變數檔 | `[[ -f ~/.vmproxy_env ]]` | — |
+| Shell hook | `grep -qF vmproxy_env` rc 檔 | `HOOK_MISSING=1` |
+| 代理連通性 | `test_host_reachable` | — |
+| 外網連通性 | `curl --max-time 3 $UPDATE_URL` | `INTERNET_OK=1` |
+| 版本比對 | 下載遠端檔取 VERSION（外網可達時） | `UPDATE_AVAILABLE=1`、`BAK_EXISTS=1` |
+
+外網連通性測試直接 curl `UPDATE_URL`（GitHub raw），一次請求同時確認外網可達與取得遠端版本。
+
 ### 更新流程 (do_update)
 
 ```
