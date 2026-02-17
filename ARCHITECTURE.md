@@ -139,6 +139,30 @@ load_config
 
 `init_shell()` 同時寫入兩個檔案，`uninit_shell()` 同時清除。
 
+### Shell hook 內容
+
+`vmproxy init` 寫入 rc 檔的內容以 marker 包裹，便於整段移除：
+
+```bash
+# >>> vmproxy >>>
+[[ -f ~/.vmproxy_env ]] && source ~/.vmproxy_env
+function vmproxy() {            ← wrapper function
+    command vmproxy "$@"        ← 呼叫真正的腳本（子進程）
+    case "$1" in
+        on)  source ~/.vmproxy_env ;;        ← 回到當前 shell，自動生效
+        off) unset http_proxy ... ;;         ← 自動清除環境變數
+        doctor)
+            cleanup → unset ...              ← cleanup 也自動清除
+            ;;
+    esac
+}
+# <<< vmproxy <<<
+```
+
+**為什麼需要 wrapper：** 腳本是子進程（fork），無法修改父進程（當前 shell）的環境變數。wrapper function 跑在當前 shell 中，先呼叫腳本做系統代理設定，再在當前 shell 補上 `source` 或 `unset`。`command vmproxy` 中的 `command` 跳過同名函數，避免無限遞迴。
+
+**舊版相容：** `init_shell()` 偵測到無 marker 的舊版 hook 時，自動移除後安裝新版。`uninit_shell()` 同時支援 marker 移除和舊版 pattern 移除。`run_diagnosis()` 區分新版（✓）、舊版（⚠ 建議重新 init）、未安裝（✗）。
+
 ## Doctor 子系統
 
 `vmproxy doctor` 提供一站式維護工具，整合診斷、更新、回滾、清理。
@@ -188,7 +212,7 @@ vmproxy doctor
 ### 更新流程 (do_update)
 
 ```
-下載到暫存檔 → 取版本號 → 比對 → bash -n 語法檢查 → 備份 .bak → 覆蓋（自動判斷 sudo）
+下載到暫存檔 → 取版本號 → 比對 → bash -n 語法檢查 → 備份 .bak → 覆蓋（自動判斷 sudo） → 偵測 hook → 自動 re-init
 ```
 
 失敗時提示 `vmproxy on` 啟用代理；成功時提示 `vmproxy doctor rollback`。

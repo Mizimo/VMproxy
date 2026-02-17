@@ -3,7 +3,7 @@
 # 讓虛擬機一鍵切換 HTTP/HTTPS/SOCKS 代理，支援 macOS 與 Linux
 # Author: 藥アイ & ChatGPT & Claude
 
-VERSION="2026.02.17"
+VERSION="2026.02.17.2"
 UPDATE_URL="https://raw.githubusercontent.com/Mizimo/VMproxy/master/vmproxy"
 
 # ========================================
@@ -225,7 +225,7 @@ function scan_proxy_server() {
     done
 
     if [[ ${#found_ips[@]} -gt 0 ]]; then
-        select_and_return found_ips "$port"
+        select_and_return "$port" "${found_ips[@]}"
         return $?
     fi
 
@@ -388,8 +388,19 @@ function get_init_files() {
     printf '%s\n' "${files[@]}" | sort -u
 }
 
-SHELL_HOOK='# vmproxy 環境變數自動載入
-[[ -f ~/.vmproxy_env ]] && source ~/.vmproxy_env'
+SHELL_HOOK='# >>> vmproxy >>>
+[[ -f ~/.vmproxy_env ]] && source ~/.vmproxy_env
+function vmproxy() {
+    command vmproxy "$@"
+    case "$1" in
+        on)  [[ -f ~/.vmproxy_env ]] && source ~/.vmproxy_env ;;
+        off) unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY ;;
+        doctor)
+            [[ "${2:-}" == "cleanup" ]] && unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+            ;;
+    esac
+}
+# <<< vmproxy <<<'
 
 # ========================================
 # C. macOS 專用函數
@@ -734,7 +745,7 @@ export ALL_PROXY=socks5://${PROXY_HOST}:${SOCKS_PORT}
 EOF
 
     echo -e "${GREEN}[OK] 系統代理已啟用${NC}"
-    echo -e "  提示: 執行 ${CYAN}source ~/.vmproxy_env${NC} 使當前終端生效"
+    echo -e "  \033[1;36m提示: 執行 source ~/.vmproxy_env 使當前終端生效${NC}"
 }
 
 function disable_proxy() {
@@ -748,7 +759,7 @@ function disable_proxy() {
 
     rm -f "$PROFILE_FILE"
     echo -e "${YELLOW}[OK] 系統代理已關閉${NC}"
-    echo -e "  提示: 執行 ${CYAN}unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY${NC} 清除當前終端變數"
+    echo -e "  \033[1;36m提示: 執行 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY 清除當前終端變數${NC}"
 }
 
 function show_status() {
@@ -783,15 +794,20 @@ function show_status() {
 }
 
 function init_shell() {
-    local files
     local files=()
     while IFS= read -r f; do files+=("$f"); done < <(get_init_files)
     local wrote=0
 
     for f in "${files[@]}"; do
-        if grep -qF 'vmproxy_env' "$f" 2>/dev/null; then
+        if grep -qF '>>> vmproxy >>>' "$f" 2>/dev/null; then
             echo -e "${YELLOW}[略過] ${f} 中已存在 $SCRIPT_NAME 設定${NC}"
             continue
+        fi
+        # 移除舊版 hook（無 marker）
+        if grep -qF 'vmproxy_env' "$f" 2>/dev/null; then
+            sed_i '/# vmproxy.*載入/d;/vmproxy_env/d' "$f"
+            sed_i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$f"
+            echo -e "${YELLOW}[升級] 移除 ${f} 中的舊版設定${NC}"
         fi
         echo "" >> "$f"
         echo "$SHELL_HOOK" >> "$f"
@@ -801,6 +817,7 @@ function init_shell() {
 
     if [[ $wrote -eq 1 ]]; then
         echo -e "  互動式終端與 SSH 非互動命令都會自動載入代理環境變數"
+        echo -e "  ${CYAN}vmproxy on/off${NC} 會自動更新當前終端環境變數"
     fi
 
     # 提示 ~/.ssh/environment 方案（需 sshd 設定 PermitUserEnvironment）
@@ -811,18 +828,27 @@ function init_shell() {
 }
 
 function uninit_shell() {
-    local files
     local files=()
     while IFS= read -r f; do files+=("$f"); done < <(get_init_files)
 
     for f in "${files[@]}"; do
-        if ! grep -qF 'vmproxy_env' "$f" 2>/dev/null; then
-            echo -e "${YELLOW}[略過] ${f} 中未找到 $SCRIPT_NAME 設定${NC}"
-            continue
+        local found=0
+        # 新版 marker 格式
+        if grep -qF '>>> vmproxy >>>' "$f" 2>/dev/null; then
+            sed_i '/^# >>> vmproxy >>>$/,/^# <<< vmproxy <<<$/d' "$f"
+            found=1
         fi
-        sed_i '/# vmproxy.*載入/d;/vmproxy_env/d' "$f"
-        sed_i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$f"
-        echo -e "${GREEN}[OK] 已從 ${f} 移除 $SCRIPT_NAME 設定${NC}"
+        # 舊版格式（相容）
+        if grep -qF 'vmproxy_env' "$f" 2>/dev/null; then
+            sed_i '/# vmproxy.*載入/d;/vmproxy_env/d' "$f"
+            found=1
+        fi
+        if [[ $found -eq 1 ]]; then
+            sed_i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$f"
+            echo -e "${GREEN}[OK] 已從 ${f} 移除 $SCRIPT_NAME 設定${NC}"
+        else
+            echo -e "${YELLOW}[略過] ${f} 中未找到 $SCRIPT_NAME 設定${NC}"
+        fi
     done
 }
 
@@ -860,10 +886,14 @@ function run_diagnosis() {
     fi
 
     # 3. Shell hook
+    HOOK_OUTDATED=0
     local rc_file
     rc_file=$(detect_rc_file)
-    if grep -qF 'vmproxy_env' "$rc_file" 2>/dev/null; then
+    if grep -qF '>>> vmproxy >>>' "$rc_file" 2>/dev/null; then
         echo -e "  Shell hook: ${CYAN}${rc_file}${NC}  ${GREEN}✓ 已安裝${NC}"
+    elif grep -qF 'vmproxy_env' "$rc_file" 2>/dev/null; then
+        echo -e "  Shell hook: ${CYAN}${rc_file}${NC}  ${YELLOW}⚠ 舊版（建議重新 init）${NC}"
+        HOOK_OUTDATED=1
     else
         echo -e "  Shell hook: ${CYAN}${rc_file}${NC}  ${RED}✗ 未安裝${NC}"
         HOOK_MISSING=1
@@ -928,6 +958,9 @@ function show_doctor_menu() {
     if [[ $HOOK_MISSING -eq 1 ]]; then
         options+=("f) 安裝 shell hook")
         keys+=("f")
+    elif [[ $HOOK_OUTDATED -eq 1 ]]; then
+        options+=("f) 更新 shell hook")
+        keys+=("f")
     fi
 
     if [[ ${#options[@]} -eq 0 ]]; then
@@ -946,7 +979,7 @@ function show_doctor_menu() {
     case "$choice" in
         u) [[ $UPDATE_AVAILABLE -eq 1 ]] && do_update || echo "無此選項" ;;
         r) [[ $BAK_EXISTS -eq 1 ]] && do_rollback || echo "無此選項" ;;
-        f) [[ $HOOK_MISSING -eq 1 ]] && do_fix_hook || echo "無此選項" ;;
+        f) [[ $HOOK_MISSING -eq 1 || $HOOK_OUTDATED -eq 1 ]] && do_fix_hook || echo "無此選項" ;;
         q|"") return ;;
         *) echo "無效的選擇" ;;
     esac
@@ -1019,6 +1052,15 @@ function do_update() {
     fi
 
     rm -f "$tmp"
+
+    # 刷新 shell hook（fork 新進程讀新腳本）
+    local rc_file
+    rc_file=$(detect_rc_file)
+    if grep -qF 'vmproxy' "$rc_file" 2>/dev/null; then
+        echo ""
+        "$self" init
+    fi
+
     echo -e "  提示: 如有問題，${CYAN}$SCRIPT_NAME doctor rollback${NC}"
 }
 
