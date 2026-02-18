@@ -745,7 +745,12 @@ export ALL_PROXY=socks5://${PROXY_HOST}:${SOCKS_PORT}
 EOF
 
     echo -e "${GREEN}[OK] 系統代理已啟用${NC}"
-    echo -e "  \033[1;36m提示: 執行 source ~/.vmproxy_env 使當前終端生效${NC}"
+    local rc_file
+    rc_file=$(detect_rc_file)
+    if ! grep -qF '>>> vmproxy >>>' "$rc_file" 2>/dev/null; then
+        echo -e "  \033[1;36m提示: 執行 source ~/.vmproxy_env 使當前終端生效${NC}"
+        echo -e "        ${CYAN}$SCRIPT_NAME init${NC} 可設定自動載入"
+    fi
 }
 
 function disable_proxy() {
@@ -759,7 +764,12 @@ function disable_proxy() {
 
     rm -f "$PROFILE_FILE"
     echo -e "${YELLOW}[OK] 系統代理已關閉${NC}"
-    echo -e "  \033[1;36m提示: 執行 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY 清除當前終端變數${NC}"
+    local rc_file
+    rc_file=$(detect_rc_file)
+    if ! grep -qF '>>> vmproxy >>>' "$rc_file" 2>/dev/null; then
+        echo -e "  \033[1;36m提示: 執行 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY 清除當前終端變數${NC}"
+        echo -e "        ${CYAN}$SCRIPT_NAME init${NC} 可設定自動載入"
+    fi
 }
 
 function show_status() {
