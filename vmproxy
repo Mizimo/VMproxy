@@ -3,7 +3,7 @@
 # 讓虛擬機一鍵切換 HTTP/HTTPS/SOCKS 代理，支援 macOS 與 Linux
 # Author: 藥アイ & ChatGPT & Claude
 
-VERSION="2026.02.17.3"
+VERSION="2026.02.19"
 UPDATE_URL="https://raw.githubusercontent.com/Mizimo/VMproxy/master/vmproxy"
 
 # ========================================
