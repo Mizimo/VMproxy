@@ -3,7 +3,7 @@
 # 讓虛擬機一鍵切換 HTTP/HTTPS/SOCKS 代理，支援 macOS 與 Linux
 # Author: 藥アイ & ChatGPT & Claude
 
-VERSION="2026.02.19"
+VERSION="2026.02.19.1"
 UPDATE_URL="https://raw.githubusercontent.com/Mizimo/VMproxy/master/vmproxy"
 
 # ========================================
@@ -1083,6 +1083,10 @@ function do_update() {
     fi
 
     echo -e "  提示: 如有問題，${CYAN}$SCRIPT_NAME doctor rollback${NC}"
+
+    # 腳本檔案已被替換，bash 繼續讀取會從錯誤的 byte offset 讀到亂碼
+    # 必須立即退出，不能 return（否則呼叫者會繼續讀檔）
+    exit 0
 }
 
 function do_rollback() {
