@@ -3,7 +3,7 @@
 # 讓虛擬機一鍵切換 HTTP/HTTPS/SOCKS 代理，支援 macOS 與 Linux
 # Author: 藥アイ & ChatGPT & Claude
 
-VERSION="2026.02.19.2"
+VERSION="2026.03.12"
 UPDATE_URL="https://raw.githubusercontent.com/Mizimo/VMproxy/master/vmproxy"
 
 # ========================================
@@ -15,6 +15,7 @@ OS="$(uname -s)"   # "Darwin" or "Linux"
 CONFIG_FILE="$HOME/.vmproxy.conf"
 PROFILE_FILE="$HOME/.vmproxy_env"
 SCRIPT_NAME="vmproxy"
+TUNNEL_PID_PREFIX="$HOME/.vmproxy_tunnel_"
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[1;31m'; CYAN='\033[0;36m'; NC='\033[0m'
 
@@ -1171,7 +1172,137 @@ function doctor() {
 }
 
 # ========================================
-# G. 主入口
+# G. Tunnel — SSH 反向隧道管理
+# ========================================
+
+function tunnel_start() {
+    local ssh_host="$1"
+    load_config
+    local port="$MIXED_PORT"
+    local pidfile="${TUNNEL_PID_PREFIX}${ssh_host}.pid"
+
+    # 檢查已存在的隧道
+    if [[ -f "$pidfile" ]]; then
+        local old_pid
+        old_pid=$(awk '{print $1}' "$pidfile")
+        if kill -0 "$old_pid" 2>/dev/null; then
+            echo -e "${YELLOW}[略過] 到 ${ssh_host} 的隧道已存在 (PID ${old_pid})${NC}"
+            return 0
+        fi
+        rm -f "$pidfile"
+    fi
+
+    # 建立隧道
+    echo -e "${CYAN}→ 建立 SSH 隧道到 ${ssh_host} (port ${port})...${NC}"
+    ssh -fN -o ExitOnForwardFailure=yes \
+        -R "${port}:127.0.0.1:${port}" "$ssh_host"
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}[錯誤] SSH 隧道建立失敗${NC}"
+        echo -e "  提示: 確認 ${CYAN}ssh ${ssh_host}${NC} 可正常連線"
+        return 1
+    fi
+
+    # 找到 ssh 背景進程的 PID
+    local ssh_pid
+    ssh_pid=$(pgrep -n -f "ssh.*-R.*${port}.*${ssh_host}")
+    if [[ -z "$ssh_pid" ]]; then
+        echo -e "${RED}[錯誤] 無法取得 SSH 進程 PID${NC}"
+        return 1
+    fi
+    echo "$ssh_pid $port" > "$pidfile"
+
+    echo -e "${GREEN}[OK] 隧道已建立 (PID ${ssh_pid})${NC}"
+
+    # 遠端配置 vmproxy
+    echo -e "${CYAN}→ 配置遠端代理...${NC}"
+    if ssh -o ClearAllForwardings=yes "$ssh_host" \
+        "PATH=/usr/local/bin:\$PATH; vmproxy config 127.0.0.1 ${port} && vmproxy on" 2>/dev/null; then
+        echo -e "${GREEN}[OK] 遠端代理已啟用${NC}"
+    else
+        echo -e "${YELLOW}[略過] 遠端 vmproxy 未安裝或配置失敗${NC}"
+        echo -e "  隧道已建立，遠端可手動使用 127.0.0.1:${port}"
+    fi
+}
+
+function tunnel_stop_one() {
+    local ssh_host="$1"
+    local pidfile="${TUNNEL_PID_PREFIX}${ssh_host}.pid"
+
+    if [[ ! -f "$pidfile" ]]; then
+        echo -e "${YELLOW}[略過] 無到 ${ssh_host} 的活躍隧道${NC}"
+        return
+    fi
+
+    local pid port
+    read -r pid port < "$pidfile"
+
+    # 嘗試遠端關閉代理
+    ssh -o ClearAllForwardings=yes -o ConnectTimeout=3 "$ssh_host" \
+        "PATH=/usr/local/bin:\$PATH; vmproxy off" 2>/dev/null
+
+    # 結束 SSH 進程
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null
+        echo -e "${GREEN}[OK] 已關閉到 ${ssh_host} 的隧道 (PID ${pid})${NC}"
+    else
+        echo -e "${YELLOW}[OK] 到 ${ssh_host} 的隧道已失效，已清理${NC}"
+    fi
+    rm -f "$pidfile"
+}
+
+function tunnel_stop() {
+    local ssh_host="${1:-}"
+
+    if [[ -n "$ssh_host" ]]; then
+        tunnel_stop_one "$ssh_host"
+    else
+        local found=0
+        for pidfile in "${TUNNEL_PID_PREFIX}"*.pid; do
+            [[ -f "$pidfile" ]] || continue
+            local host
+            host=$(basename "$pidfile" .pid)
+            host="${host#.vmproxy_tunnel_}"
+            tunnel_stop_one "$host"
+            found=1
+        done
+        if [[ $found -eq 0 ]]; then
+            echo -e "${YELLOW}無活躍隧道${NC}"
+        fi
+    fi
+}
+
+function tunnel_status() {
+    local found=0
+    for pidfile in "${TUNNEL_PID_PREFIX}"*.pid; do
+        [[ -f "$pidfile" ]] || continue
+        local host pid port
+        host=$(basename "$pidfile" .pid)
+        host="${host#.vmproxy_tunnel_}"
+        read -r pid port < "$pidfile"
+        if kill -0 "$pid" 2>/dev/null; then
+            echo -e "  ${GREEN}●${NC} ${host}  port=${port}  PID=${pid}"
+            found=1
+        else
+            echo -e "  ${RED}●${NC} ${host}  port=${port}  ${RED}(已斷線，清理中)${NC}"
+            rm -f "$pidfile"
+        fi
+    done
+    if [[ $found -eq 0 ]]; then
+        echo -e "${YELLOW}無活躍隧道${NC}"
+    fi
+}
+
+function tunnel() {
+    case "${2:-}" in
+        stop)    tunnel_stop "${3:-}" ;;
+        status)  tunnel_status ;;
+        "")      echo "用法: $SCRIPT_NAME tunnel <ssh-host> | stop [host] | status" ;;
+        *)       tunnel_start "$2" ;;
+    esac
+}
+
+# ========================================
+# H. 主入口
 # ========================================
 
 case "$1" in
@@ -1181,6 +1312,7 @@ case "$1" in
     init)      init_shell ;;
     config)    config_proxy "$@" ;;
     doctor)    doctor "$@" ;;
+    tunnel)    tunnel "$@" ;;
     *)
         echo "$SCRIPT_NAME - VM 代理管理工具 (v${VERSION})"
         echo ""
@@ -1198,6 +1330,9 @@ case "$1" in
         echo "  doctor update                更新至最新版本"
         echo "  doctor rollback              回滾至上一版本"
         echo "  doctor cleanup               清理環境（還原網路 + 移除設定）"
+        echo "  tunnel <ssh-host>            建立 SSH 反向隧道到遠端 VM"
+        echo "  tunnel stop [ssh-host]       關閉隧道（不指定則全部關閉）"
+        echo "  tunnel status                查看活躍隧道"
         echo ""
         echo "支援: macOS (networksetup), Linux (GNOME/KDE/CLI)"
         ;;
